@@ -1,0 +1,434 @@
+import cv2, numpy as np, chess
+from collections import Counter
+from stockfish import Stockfish
+
+CAMERA_INDEX = 1
+BOARD_SIZE = 800
+MODE = 0
+ENGINE_PATH = r"C:\Users\path\to\stockfish.exe" #changed for general code
+
+DIFF_T, PIXEL_T, AREA_T, BIN_T = 15, 35, 20, 25
+SMOOTH_A, CORNER_JUMP = 0.85, 25
+HISTORY_SIZE, STABLE_MIN = 5, 2
+STABLE_REQUIRED = 5
+
+FILES, RANKS = "abcdefgh", "87654321"
+
+board = chess.Board()
+engine = Stockfish(path=ENGINE_PATH)
+engine.set_skill_level(10)
+engine.set_depth(12)
+
+PHASE_SYNC = "SYNC"
+PHASE_WAIT_HUMAN = "WAIT_HUMAN"
+PHASE_WAIT_ENGINE_SYNC = "WAIT_ENGINE_SYNC"
+
+def sq_name(i, mode=0):
+    r, c = divmod(i, 8)
+    maps = {
+        0: (c, r), 1: (7 - c, r), 2: (c, 7 - r), 3: (7 - c, 7 - r),
+        4: (r, c), 5: (7 - r, c), 6: (r, 7 - c), 7: (7 - r, 7 - c)
+    }
+    f, rk = maps[mode]
+    return FILES[f] + RANKS[rk]
+
+def order_pts(pts):
+    pts = np.array(pts, np.float32)
+    s, d = pts.sum(axis=1), np.diff(pts, axis=1)
+    return np.array([pts[np.argmin(s)], pts[np.argmin(d)], pts[np.argmax(s)], pts[np.argmax(d)]], np.float32)
+
+def warp(img, pts, size=800):
+    pts = order_pts(pts)
+    dst = np.array([[0, 0], [size - 1, 0], [size - 1, size - 1], [0, size - 1]], np.float32)
+    M = cv2.getPerspectiveTransform(pts, dst)
+    return cv2.warpPerspective(img, M, (size, size))
+
+def preprocess(img):
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    g = cv2.GaussianBlur(g, (5, 5), 0)
+    g = cv2.equalizeHist(g)
+    e = cv2.Canny(g, 50, 150)
+    k = np.ones((5, 5), np.uint8)
+    return cv2.erode(cv2.dilate(e, k, 1), k, 1)
+
+def find_board(img):
+    dbg = img.copy()
+    contours, _ = cv2.findContours(preprocess(img), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best, best_area = None, 0
+
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < 10000:
+            continue
+        approx = cv2.approxPolyDP(c, 0.02 * cv2.arcLength(c, True), True)
+        if len(approx) != 4:
+            continue
+        x, y, w, h = cv2.boundingRect(approx)
+        if h == 0:
+            continue
+        ar = w / float(h)
+        if 0.8 <= ar <= 1.2 and area > best_area:
+            best, best_area = approx, area
+
+    if best is not None:
+        cv2.drawContours(dbg, [best], -1, (0, 255, 0), 3)
+        return best.reshape(4, 2), dbg
+    return None, dbg
+
+def draw_grid(img, mode=0):
+    out = img.copy()
+    h, w = out.shape[:2]
+    sh, sw = h // 8, w // 8
+    for r in range(8):
+        for c in range(8):
+            x, y = c * sw, r * sh
+            cv2.rectangle(out, (x, y), (x + sw, y + sh), (0, 0, 255), 2)
+            cv2.putText(
+                out,
+                sq_name(r * 8 + c, mode),
+                (x + 8, y + 22),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 0, 0),
+                1
+            )
+    return out
+
+def split_squares(warped):
+    h, w = warped.shape[:2]
+    sh, sw = h // 8, w // 8
+    return [warped[r * sh:(r + 1) * sh, c * sw:(c + 1) * sw] for r in range(8) for c in range(8)]
+
+def square_metrics(cur, ref):
+    cg = cv2.GaussianBlur(cv2.cvtColor(cur, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+    rg = cv2.GaussianBlur(cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+
+    h, w = cg.shape
+    y1, y2 = h // 5, 4 * h // 5
+    x1, x2 = w // 5, 4 * w // 5
+
+    cur_crop = cg[y1:y2, x1:x2]
+    ref_crop = rg[y1:y2, x1:x2]
+
+    diff = cv2.absdiff(cur_crop, ref_crop)
+    mean_d = float(diff.mean())
+    if mean_d > 8:
+        mean_d *= 1.5
+
+    _, th = cv2.threshold(diff, BIN_T, 255, cv2.THRESH_BINARY)
+    px = int(cv2.countNonZero(th))
+    contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    area = max([cv2.contourArea(c) for c in contours], default=0.0)
+
+    return mean_d, px, area
+
+def detect_changes(current_squares, ref_squares, mode=0):
+    if ref_squares is None:
+        return []
+    out = []
+    for i in range(64):
+        d, px, area = square_metrics(current_squares[i], ref_squares[i])
+        if d > DIFF_T and (px > PIXEL_T or area > AREA_T):
+            out.append((sq_name(i, mode), round(d, 2), px, round(area, 2)))
+    return out
+
+def stable_names(history, min_count=2):
+    c = Counter()
+    for names in history:
+        for n in set(names):
+            c[n] += 1
+    return sorted([n for n, k in c.items() if k >= min_count])
+
+def move_info(board_obj, move):
+    san = board_obj.san(move)
+    piece = board_obj.piece_at(move.from_square)
+
+    piece_letter = ""
+    if piece:
+        piece_letter = piece.symbol().upper() if piece.color == chess.WHITE else piece.symbol()
+
+    extras = []
+    if board_obj.is_capture(move):
+        extras.append("capture")
+    if board_obj.gives_check(move):
+        extras.append("check")
+    if board_obj.is_castling(move):
+        extras.append("castle")
+    if board_obj.is_en_passant(move):
+        extras.append("en-passant")
+    if move.promotion is not None:
+        extras.append("promotion")
+
+    extra_text = f" [{', '.join(extras)}]" if extras else ""
+    return san, piece_letter, extra_text
+
+def move_score(move, changed, board_obj):
+    changed = set(changed)
+    frm = chess.square_name(move.from_square)
+    to = chess.square_name(move.to_square)
+    expected = {frm, to}
+    score = 0
+
+    if frm in changed:
+        score += 4
+    if to in changed:
+        score += 4
+    score += 2 * len(expected & changed)
+    score -= 1.5 * len(changed - expected)
+
+    piece = board_obj.piece_at(move.from_square)
+    if piece and piece.color == board_obj.turn:
+        score += 1
+
+    return score
+
+def filtered_legal_moves(board_obj, allow_special=False):
+    moves = []
+    for m in board_obj.legal_moves:
+        if not allow_special:
+            if board_obj.is_castling(m):
+                continue
+            if board_obj.is_en_passant(m):
+                continue
+            if m.promotion is not None:
+                continue
+        moves.append(m)
+    return moves
+
+def detect_move(changed_names, board_obj):
+    legal_moves = filtered_legal_moves(board_obj, allow_special=False)
+
+    if len(changed_names) == 1:
+        changed = changed_names[0]
+        candidates = []
+        for m in legal_moves:
+            frm = chess.square_name(m.from_square)
+            to = chess.square_name(m.to_square)
+            if frm == changed or to == changed:
+                candidates.append(m)
+        return candidates[0] if len(candidates) == 1 else None
+
+    if len(changed_names) < 2 or len(changed_names) > 4:
+        return None
+
+    scored = []
+    for m in legal_moves:
+        s = move_score(m, changed_names, board_obj)
+        if s >= 8:
+            scored.append((s, m))
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_score = scored[0][0]
+    best = [m for s, m in scored if s == best_score]
+    return best[0] if len(best) == 1 else None
+
+def engine_best_move(board_obj):
+    engine.set_fen_position(board_obj.fen())
+    uci = engine.get_best_move()
+    if not uci:
+        return None
+
+    raw = chess.Move.from_uci(uci)
+    if raw not in board_obj.legal_moves:
+        return None
+
+    if board_obj.is_castling(raw):
+        return None
+    if board_obj.is_en_passant(raw):
+        return None
+    if raw.promotion is not None:
+        return None
+
+    return raw
+
+def status_text(phase, pending_engine_move):
+    if phase == PHASE_SYNC:
+        return "SYNC: press s"
+    if phase == PHASE_WAIT_HUMAN:
+        return "WAIT HUMAN MOVE"
+    if phase == PHASE_WAIT_ENGINE_SYNC:
+        return f"PLAY ENGINE: {pending_engine_move.uci()} THEN PRESS s"
+    return phase
+
+def main():
+    global board
+
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        print("Could not open camera")
+        return
+
+    smoothed = None
+    locked = False
+    hist = []
+    stable = []
+    stable_counter = 0
+    last_printed = None
+
+    ref_squares = None
+    phase = PHASE_SYNC
+    pending_engine_move = None
+
+    print("s = sync current board as truth")
+    print("x = force sync image only")
+    print("z = undo pending engine move")
+    print("l = lock board corners, u = unlock")
+    print("r = reset chess logic")
+    print("q = quit")
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        pts, dbg = find_board(frame)
+        squares = None
+
+        if pts is not None:
+            pts = order_pts(pts)
+
+            if smoothed is None:
+                smoothed = pts.copy()
+            elif not locked and np.linalg.norm(smoothed - pts) < CORNER_JUMP:
+                smoothed = SMOOTH_A * smoothed + (1 - SMOOTH_A) * pts
+
+            warped = warp(frame, smoothed if smoothed is not None else pts, BOARD_SIZE)
+            squares = split_squares(warped)
+
+            overlay = draw_grid(warped, MODE)
+            cv2.putText(
+                overlay,
+                status_text(phase, pending_engine_move),
+                (10, 790),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2
+            )
+            cv2.imshow("Warped", overlay)
+
+            if ref_squares is not None and phase == PHASE_WAIT_HUMAN:
+                names = [n for n, _, _, _ in detect_changes(squares, ref_squares, MODE)]
+                hist.append(names)
+                if len(hist) > HISTORY_SIZE:
+                    hist.pop(0)
+
+                new_stable = stable_names(hist, STABLE_MIN)
+                if new_stable == stable:
+                    stable_counter += 1
+                else:
+                    stable = new_stable
+                    stable_counter = 0
+
+                printable = stable if 1 <= len(stable) <= 4 else []
+                if printable != last_printed:
+                    if printable:
+                        print("Stable changed squares:", printable)
+                    last_printed = printable[:]
+
+                if stable_counter >= STABLE_REQUIRED and len(stable) <= 4:
+                    move = detect_move(stable, board)
+                    if move is not None:
+                        san, piece_letter, extra_text = move_info(board, move)
+                        board.push(move)
+                        ref_squares = [sq.copy() for sq in squares]
+                        hist.clear()
+                        stable = []
+                        stable_counter = 0
+                        last_printed = None
+                        print(f"Human move: {move.uci()} | {san} | piece={piece_letter}{extra_text}")
+
+                        pending_engine_move = engine_best_move(board)
+                        if pending_engine_move is None:
+                            print("Engine has no supported legal move right now.")
+                            phase = PHASE_SYNC
+                        else:
+                            san, piece_letter, extra_text = move_info(board, pending_engine_move)
+                            board.push(pending_engine_move)
+                            print(f"Engine move: {pending_engine_move.uci()} | {san} | piece={piece_letter}{extra_text}")
+                            print("Play that move physically, then press 's'.")
+                            phase = PHASE_WAIT_ENGINE_SYNC
+
+        cv2.imshow("Debug", dbg)
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord('s'):
+            if squares is None:
+                print("Board not detected.")
+            else:
+                if phase == PHASE_WAIT_HUMAN and len(stable) > 0:
+                    print("Board differs from expected state.")
+                    print("Use 'x' to force sync image only, or 'r' to reset logic.")
+                    continue
+
+                ref_squares = [sq.copy() for sq in squares]
+                hist.clear()
+                stable = []
+                stable_counter = 0
+                last_printed = None
+
+                if phase == PHASE_WAIT_ENGINE_SYNC:
+                    pending_engine_move = None
+                    phase = PHASE_WAIT_HUMAN
+                    print("Engine move synced. Waiting for human move.")
+                else:
+                    phase = PHASE_WAIT_HUMAN
+                    print("Synced current board as truth.")
+
+        elif key == ord('x'):
+            if squares is None:
+                print("Board not detected.")
+            else:
+                ref_squares = [sq.copy() for sq in squares]
+                hist.clear()
+                stable = []
+                stable_counter = 0
+                last_printed = None
+                print("Forced image sync only. Internal chess logic unchanged.")
+
+        elif key == ord('z'):
+            if phase == PHASE_WAIT_ENGINE_SYNC and pending_engine_move is not None:
+                try:
+                    board.pop()  
+                    pending_engine_move = None
+                    phase = PHASE_WAIT_HUMAN
+                    hist.clear()
+                    stable = []
+                    stable_counter = 0
+                    last_printed = None
+                    print("Undid pending engine move. Waiting for human move.")
+                except IndexError:
+                    print("Nothing to undo.")
+            else:
+                print("No pending engine move to undo.")
+
+        elif key == ord('l'):
+            locked = True
+            print("Board locked.")
+
+        elif key == ord('u'):
+            locked = False
+            print("Board unlocked.")
+
+        elif key == ord('r'):
+            board = chess.Board()
+            ref_squares = None
+            hist.clear()
+            stable = []
+            stable_counter = 0
+            last_printed = None
+            pending_engine_move = None
+            phase = PHASE_SYNC
+            print("Reset chess logic. Set pieces correctly, then press 's'.")
+
+        elif key == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
